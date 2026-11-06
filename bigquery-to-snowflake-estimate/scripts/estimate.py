@@ -42,8 +42,7 @@ DEFAULTS = {
     "low_factor": 0.80,
     "high_factor": 1.20,
 }
-REQUIRED_COLS = ["project_id", "year_month", "total_slot_ms", "active_minutes_in_month",
-                 "pct_of_month_active"]
+REQUIRED_COLS = ["project_id", "year_month", "total_slot_ms", "active_minutes_in_month"]
 TRACKS = ["RES", "OD"]
 TRACK_NAMES = {"RES": "Reserved slots", "OD": "On-demand", "COMBINED": "Combined",
                "STORAGE": "Storage"}
@@ -107,16 +106,12 @@ def validate(rows: list[dict], months: list[str], tags: dict) -> list[str]:
         errors.append(f"Missing months: {', '.join(missing)}")
     if extra:
         errors.append(f"Months outside the requested range: {', '.join(extra)}")
-    files_by_month = defaultdict(set)
-    for r in rows:
-        files_by_month[r["year_month"]].add(r["source_file"])
-    dup = sorted(m for m, fs in files_by_month.items() if len(fs) > 1)
-    if dup:
-        errors.append("Month(s) found in more than one file: " + ", ".join(dup))
+    # Several files are fine (e.g. one per project or per region); the same project/month twice is not.
     pairs = Counter((r["project_id"], r["year_month"]) for r in rows)
-    n_dup = sum(c - 1 for c in pairs.values() if c > 1)
-    if n_dup:
-        errors.append(f"{n_dup} duplicate project/month rows")
+    dups = sorted(f"{p} {m}" for (p, m), c in pairs.items() if c > 1)
+    if dups:
+        errors.append(f"{len(dups)} project/month row(s) appear more than once (same data loaded twice?): "
+                      + ", ".join(dups[:10]) + (" ..." if len(dups) > 10 else ""))
     untagged = sorted({r["project_id"] for r in rows} - set(tags))
     if untagged:
         errors.append("Projects not tagged RES/OD: " + ", ".join(untagged))
@@ -138,19 +133,39 @@ def monthly_rate(annual: float) -> float:
 
 
 def calculate(rows: list[dict], months: list[str], tags: dict, inp: dict) -> dict:
-    # Step 1 - utilization per track over every active project-month
+    # Step 1 - PER PROJECT-MONTH. Each row is calculated on its own with that project's own measured
+    # wall-clock active time, so a busy project and an idle project are never averaged together:
+    #   X-Small nodes = slot ms / 3,600,000 / 730 / 16
+    #   active hours  = active_minutes_in_month / 60   (capped at the hours in that calendar month)
+    #   credits       = X-Small nodes x active hours x 1 credit per X-Small node hour
+    # Credits are then added up per track and month.
+    slot_ms_by = defaultdict(float)
+    credits_by = defaultdict(float)
+    row_calcs = []
+    for r in rows:
+        key = (tags[r["project_id"]], r["year_month"])
+        cal_hours = minutes_in_month(r["year_month"]) / 60
+        active_hours = min(r["active_minutes_in_month"] / 60, cal_hours)
+        avg_slots = r["total_slot_ms"] / 3_600_000 / HOURS_PER_MONTH
+        row_nodes = avg_slots / SLOTS_PER_XS_NODE
+        row_credits = row_nodes * active_hours * CREDITS_PER_XS_NODE_HOUR
+        slot_ms_by[key] += r["total_slot_ms"]
+        credits_by[key] += row_credits
+        row_calcs.append({"project_id": r["project_id"], "track": key[0], "month": r["year_month"],
+                          "slot_ms": r["total_slot_ms"], "avg_slots": avg_slots, "xs_nodes": row_nodes,
+                          "active_hours": active_hours, "credits": row_credits,
+                          "cost": row_credits * inp["price_per_credit"]})
+
     util = {}
     for t in TRACKS:
         sub = [r for r in rows if tags[r["project_id"]] == t]
         active = sum(r["active_minutes_in_month"] for r in sub)
         total = float(sum(minutes_in_month(r["year_month"]) for r in sub))
+        # Effective utilization (display only) = credits / credits if every project ran all 730 hours
+        full = sum(slot_ms_by[(t, m)] for m in months) / 3_600_000 / SLOTS_PER_XS_NODE * CREDITS_PER_XS_NODE_HOUR
         util[t] = {"active_minutes": active, "total_minutes": total,
-                   "pct": active / total if total else 0.0,
+                   "pct": (sum(credits_by[(t, m)] for m in months) / full) if full else 0.0,
                    "project_months": len(sub)}
-
-    slot_ms_by = defaultdict(float)
-    for r in rows:
-        slot_ms_by[(tags[r["project_id"]], r["year_month"])] += r["total_slot_ms"]
 
     # Steps 2-6 - per track, per month
     monthly = []
@@ -160,8 +175,10 @@ def calculate(rows: list[dict], months: list[str], tags: dict, inp: dict) -> dic
             slot_hours = slot_ms / 3_600_000
             avg_slots = slot_hours / HOURS_PER_MONTH
             xs_nodes = avg_slots / SLOTS_PER_XS_NODE
-            credits = xs_nodes * CREDITS_PER_XS_NODE_HOUR * HOURS_PER_MONTH * util[t]["pct"]
+            credits = credits_by[(t, m)]  # sum of per-project credits
+            full = xs_nodes * CREDITS_PER_XS_NODE_HOUR * HOURS_PER_MONTH
             monthly.append({"month": m, "track": t, "slot_ms": slot_ms, "slot_hours": slot_hours,
+                            "util_pct": credits / full if full else 0.0,
                             "avg_slots": avg_slots, "xs_nodes": xs_nodes, "credits": credits,
                             "cost": credits * inp["price_per_credit"]})
 
@@ -196,7 +213,7 @@ def calculate(rows: list[dict], months: list[str], tags: dict, inp: dict) -> dic
                       "credits": sum(x["credits"] for x in sub),
                       "end_tb": sub[-1]["storage_tb"]})
 
-    return {"util": util, "monthly": monthly, "track_credits": track_credits, "avg_credits": avg_credits,
+    return {"util": util, "monthly": monthly, "row_calcs": row_calcs, "track_credits": track_credits, "avg_credits": avg_credits,
             "starting_credits": starting_credits, "s_rates": s_rates, "c_rates": c_rates,
             "month1_tb": month1_tb, "projection": proj, "years": years, "n_months": n_months}
 
@@ -460,9 +477,10 @@ Use the <a href="{SLOT_CALCULATOR_URL}">Google Slot Calculator</a> Streamlit app
     out.append('<div class="phase">Part 1 - Compute: each track calculated separately</div>')
     for t, o in (("RES", "1a"), ("OD", "1b")):
         u = r["util"][t]
-        step(o, t, f"Utilization % ({TRACK_NAMES[t]})",
-             "Active Minutes / Total Minutes (across all active project-months)",
-             f'{num(u["active_minutes"])} / {num(u["total_minutes"])}', pct(u["pct"]))
+        step(o, t, f"Active hours per project-month ({TRACK_NAMES[t]})",
+             "Active Hours = active_minutes_in_month / 60, for each project and month separately (never averaged across projects)",
+             f'{num(u["project_months"])} project-months; {num(u["active_minutes"] / 60, 1)} active hours in total',
+             f'Effective utilization {pct(u["pct"])} of 730 hours (for reference only)')
     for t, o in (("RES", "2a"), ("OD", "2b")):
         step(o, t, "Slot hours", "Slot ms / 3,600,000",
              f'{num(m0[t]["slot_ms"])} / 3,600,000', f'{num(m0[t]["slot_hours"], 1)} slot hours ({month_label(first)})')
@@ -473,10 +491,12 @@ Use the <a href="{SLOT_CALCULATOR_URL}">Google Slot Calculator</a> Streamlit app
         step(o, t, "Equivalent X-Small nodes", "Average Slots / 16 slots per X-Small node",
              f'{num(m0[t]["avg_slots"], 2)} / {SLOTS_PER_XS_NODE}', f'{num(m0[t]["xs_nodes"], 2)} X-Small nodes')
     for t, o in (("RES", "5a"), ("OD", "5b")):
+        parts = [x for x in r["row_calcs"] if x["track"] == t and x["month"] == first]
+        shown = " + ".join(f'({num(x["xs_nodes"], 3)} x {num(x["active_hours"], 1)})' for x in parts[:4])
         step(o, t, "Credits per month",
-             "X-Small Nodes x 1 credit/hr x Hours per Month x Utilization %",
-             f'{num(m0[t]["xs_nodes"], 2)} x 1 x {HOURS_PER_MONTH} x {pct(r["util"][t]["pct"])}',
-             f'{num(m0[t]["credits"])} credits')
+             "SUM over projects (Project X-Small Nodes x Project Active Hours x 1 credit per X-Small node hour)",
+             (shown + (f" + {len(parts) - 4} more projects" if len(parts) > 4 else "")) or "no projects",
+             f'{num(m0[t]["credits"])} credits (see the per-project table)')
     for t, o in (("RES", "6a"), ("OD", "6b")):
         step(o, t, "Monthly compute cost", "Credits per Month x Price per Credit",
              f'{num(m0[t]["credits"])} x {money(inp["price_per_credit"], 2)}', money(m0[t]["cost"]))
@@ -486,6 +506,28 @@ Use the <a href="{SLOT_CALCULATOR_URL}">Google Slot Calculator</a> Streamlit app
              f'{num(tot)} / {r["n_months"]}', f'{num(r["avg_credits"][t])} credits/month')
     step("8", "COMBINED", "Starting monthly credits", "Avg Monthly Credits RES + Avg Monthly Credits OD",
          f'{num(r["avg_credits"]["RES"])} + {num(r["avg_credits"]["OD"])}', f'{num(r["starting_credits"])} credits/month')
+
+    out.append('<h3>Per-project credits (every project and month)</h3>'
+               '<p class="note">Each row is calculated on its own; track totals above are the sum of these rows.</p>')
+    out.append('<div class="table-wrap"><table><thead><tr><th>Project</th><th>Track</th><th>Month</th>'
+               '<th class="n">Slot ms</th><th class="n">Avg slots (ms / 3.6M / 730)</th>'
+               '<th class="n">X-Small nodes (slots / 16)</th><th class="n">Active hours</th>'
+               '<th class="n">Credits (nodes x hours)</th><th class="n">Cost</th></tr></thead><tbody>')
+    for pid in sorted({x["project_id"] for x in r["row_calcs"]},
+                      key=lambda p: -sum(x["credits"] for x in r["row_calcs"] if x["project_id"] == p)):
+        prow = sorted((x for x in r["row_calcs"] if x["project_id"] == pid), key=lambda x: x["month"])
+        for x in prow:
+            out.append(f'<tr><td>{esc(pid)}</td><td>{badge(x["track"])}</td><td>{month_label(x["month"])}</td>'
+                       f'<td class="n">{num(x["slot_ms"])}</td><td class="n">{num(x["avg_slots"], 2)}</td>'
+                       f'<td class="n">{num(x["xs_nodes"], 3)}</td><td class="n">{num(x["active_hours"], 1)}</td>'
+                       f'<td class="n">{num(x["credits"], 2)}</td><td class="n">{money(x["cost"], 2)}</td></tr>')
+        out.append(f'<tr class="total"><td colspan="7">{esc(pid)} total ({len(prow)} months)</td>'
+                   f'<td class="n">{num(sum(x["credits"] for x in prow), 2)}</td>'
+                   f'<td class="n">{money(sum(x["cost"] for x in prow), 2)}</td></tr>')
+    all_cr = sum(x["credits"] for x in r["row_calcs"])
+    out.append(f'<tr class="total"><td colspan="7">All projects, all months</td><td class="n">{num(all_cr, 2)}</td>'
+               f'<td class="n">{money(all_cr * inp["price_per_credit"], 2)}</td></tr>')
+    out.append("</tbody></table></div>")
 
     out.append('<div class="phase">Part 2 - Storage</div>')
     step("9", "STORAGE", "Month 1 storage", "Initial Storage x (1 + Time Travel / Failsafe %)",
@@ -538,8 +580,10 @@ Use the <a href="{SLOT_CALCULATOR_URL}">Google Slot Calculator</a> Streamlit app
         f"Actual throughput varies by workload (ETL, BI, ad hoc).",
         f"The baseline averages {r['n_months']} months of usage. Short observation periods, one-time loads, or "
         f"seasonal peaks outside the window make the estimate less reliable.",
-        "Utilization % is calculated across every project-month that had activity. Months where a project ran "
-        "no queries are not included.",
+        "Credits are calculated separately for each project-month from that project's own measured wall-clock "
+        "active time (overlapping queries merged), then added. Months where a project ran no queries are not included.",
+        "BigQuery on-demand bytes-scanned fees are not part of this estimate. Snowflake does not charge for bytes "
+        "scanned: compute is billed in credits only while a warehouse runs, plus storage.",
         "Prices are " + ("customer contract values." if {"price_per_credit", "price_per_tb"} <= overridden
                          else "list-price defaults unless marked as customer values in Inputs."),
         f"The {pct(inp['low_factor'], 0)} / {pct(inp['high_factor'], 0)} range reflects estimation uncertainty "

@@ -15,7 +15,7 @@ description: "Explains, step by step, the calculations used to estimate a custom
 - 16 BigQuery slots = 1 **X-Small Snowflake node**. This is a hardware comparison. Never call it a "credit-hour."
 - Never hardcode customer values. Everything comes from the Step 2 inputs.
 - All math runs in `scripts/estimate.py`. Do not recalculate by hand.
-- The HTML report is produced **only** by `scripts/estimate.py`. Its built-in template is the approved design (see `sample_estimate/` in the repo). Never write, restyle, or rebuild the report HTML yourself, and do not use the `html-authoring` skill or any other template for it. If the script cannot run, stop and fix the environment; do not substitute a hand-built report.
+- The HTML report is produced **only** by `scripts/estimate.py`. Its built-in template is the approved design. Never write, restyle, or rebuild the report HTML yourself, and do not use the `html-authoring` skill or any other template for it. If the script cannot run, stop and fix the environment; do not substitute a hand-built report.
 
 ## Workflow
 
@@ -24,15 +24,16 @@ description: "Explains, step by step, the calculations used to estimate a custom
    - **Start date** = the first day of the first month (e.g., `2026-03-01` for March).
    - **End date** = the first day of the month **after** the last month (e.g., `2026-10-01` to end with September). The end date is not included.
    - Both dates must be the 1st of a month. If either isn't, explain the rule and ask again.
+   - BigQuery keeps about **180 days** of job history in `INFORMATION_SCHEMA.JOBS`. The start date must be inside the last ~180 days; otherwise the earliest months come back empty or partial. `make_queries.py` warns when it isn't.
 2. Generate one query for the whole range:
    ```bash
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/make_queries.py \
      --start <YYYY-MM-01> --end <YYYY-MM-01> --region <region> --out-dir <PROJECT_DIR>/<customer>_bq_estimate/queries
    ```
-   The query returns one row per project per month, so a 7-month range is still one query.
+   The query returns one row per project per month, so a multi-month range is still one query.
 3. Show the query in one code block.
-4. Tell the user to run it once in the BigQuery console and download the result as a single CSV.
-5. Remind them that `INFORMATION_SCHEMA.JOBS` only returns projects their permissions can see, so they should confirm every project is included.
+4. Tell the user to run it in the BigQuery console and download the result as CSV.
+5. **Project coverage:** `INFORMATION_SCHEMA.JOBS` covers only the project the query runs in (it is the same view as `JOBS_BY_PROJECT`). To capture every project at once, change the `FROM` line to `INFORMATION_SCHEMA.JOBS_BY_ORGANIZATION` (organization-level permission required; the alternative is noted in the query). Otherwise run the query in each project and collect one CSV per project. Ask the user to confirm every project in scope is in the results.
 
 ### Step 2: Capture the customer inputs
 Show this table of inputs and defaults, then make **one** `ask_user_question` call with three text questions:
@@ -59,7 +60,7 @@ Write the answers to `<PROJECT_DIR>/<customer>_bq_estimate/inputs.json` (percent
 **⚠️ STOP**: Show all inputs in one table and get confirmation.
 
 ### Step 3: Collect the CSV results
-1. Ask the user to attach the CSV and copy it to `<customer>_bq_estimate/csv/`. (Several CSVs also work, as long as each month appears in only one file.)
+1. Ask the user to attach the CSV(s) and copy them to `<customer>_bq_estimate/csv/`. Several CSVs are fine (for example one per project or per region), as long as the same project/month row does not appear twice. Required columns: `project_id`, `year_month`, `total_slot_ms`, `active_minutes_in_month`.
 2. List the distinct `project_id` values. Every project defaults to **RES** (reserved slots). In one `ask_user_question` text question, ask which projects are **OD** (on-demand); blank means all RES. Write the tags to `project_tags.json` as `{"project": "RES"}`.
 3. Validate:
    ```bash
@@ -67,13 +68,16 @@ Write the answers to `<PROJECT_DIR>/<customer>_bq_estimate/inputs.json` (percent
      --csv <DIR>/csv --inputs <DIR>/inputs.json --tags <DIR>/project_tags.json \
      --start <YYYY-MM-01> --end <YYYY-MM-01> --out <DIR>/report.html --validate-only
    ```
-   If validation fails (missing columns or months, a month in more than one file, untagged projects), show the errors and fix them with the user. Try at most 3 times.
+   If validation fails (missing columns or months, duplicate project/month rows, untagged projects), show the errors and fix them with the user. Try at most 3 times.
 
 ### Step 4: Run the calculations
 Run the same command without `--validate-only`, adding `--results <DIR>/results.json`. Output file: `<DIR>/<Customer>_BigQuery_to_Snowflake_Estimate_<YYYY-MM-DD>.html`.
 
-The script follows the Calculation Sequence:
-- Steps 1-7 run separately for RES and OD. Utilization % = active minutes / calendar minutes across the track's active project-months.
+The script follows the Calculation Sequence. Steps 1-7 run separately for RES and OD, and every project-month is calculated **on its own** (projects are never averaged together):
+- **Active hours** (per project-month) = `active_minutes_in_month / 60`. This is wall-clock time with at least one query running, overlaps merged, capped at the hours in that calendar month.
+- **Slot hours** = `total_slot_ms / 3,600,000`; **Average slots** = slot hours / 730; **X-Small nodes** = average slots / 16.
+- **Credits** (per project-month) = X-Small nodes × active hours × 1 credit per X-Small node hour. Track credits for a month = the sum of its projects' credits. The report lists every project-month's credits and each project's total.
+- **Monthly cost** = credits × price per credit. Step 7 averages each track's monthly credits over the months observed.
 - Step 8 combines the two tracks into the starting monthly credits.
 - Steps 9-11: storage starts at initial TB × (1 + TT/FS %) and grows monthly at each year's rate, where monthly rate = (1 + annual)^(1/12) − 1.
 - Step 12: compute grows the same way, using each year's compute rate.
