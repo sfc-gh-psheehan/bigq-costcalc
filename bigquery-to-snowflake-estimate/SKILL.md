@@ -5,7 +5,7 @@ description: "Explains, step by step, the calculations used to estimate a custom
 
 # BigQuery to Snowflake Cost Estimate: Calculation Explainer
 
-> **Use the Google Slot Calculator for official estimates.** This skill explains the calculations behind a BigQuery-to-Snowflake estimate. It does not replace the Google Slot Calculator Streamlit app: https://app.snowflake.com/streamlit/sfcogsops/snowhouse_aws_us_west_2/#/apps/icosbexzbmbas7a4gzfw
+> **Use the Google Slot Calculator for official estimates.** This skill explains the calculations behind a BigQuery-to-Snowflake estimate. It does not replace the Google Slot Calculator Streamlit app: https://app.snowflake.com/streamlit/sfcogsops/snowhouse_aws_us_west_2/#/apps/ki4qh2k5pei7xqdkpz7k
 >
 > Tell the user this at the start of every run, and include the same callout at the top of the HTML report.
 
@@ -61,30 +61,32 @@ Write the answers to `<PROJECT_DIR>/<customer>_bq_estimate/inputs.json` (percent
 
 ### Step 3: Collect the CSV results
 1. Ask the user to attach the CSV(s) and copy them to `<customer>_bq_estimate/csv/`. Several CSVs are fine (for example one per project or per region), as long as the same project/month row does not appear twice. Required columns: `project_id`, `year_month`, `total_slot_ms`, `active_minutes_in_month`.
-2. List the distinct `project_id` values. Every project defaults to **RES** (reserved slots). In one `ask_user_question` text question, ask which projects are **OD** (on-demand); blank means all RES. Write the tags to `project_tags.json` as `{"project": "RES"}`.
-3. Validate:
+2. Validate:
    ```bash
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/estimate.py \
-     --csv <DIR>/csv --inputs <DIR>/inputs.json --tags <DIR>/project_tags.json \
-     --start <YYYY-MM-01> --end <YYYY-MM-01> --out <DIR>/report.html --validate-only
+     --csv <DIR>/csv --inputs <DIR>/inputs.json \
+     --start <YYYY-MM-01> --end <YYYY-MM-01> --out <DIR>/<Customer>_BigQuery_to_Snowflake_Estimate_<YYYY-MM-DD>.html --validate-only
    ```
-   If validation fails (missing columns or months, duplicate project/month rows, untagged projects), show the errors and fix them with the user. Try at most 3 times.
+   The script prints the months used for the monthly average: every calendar month from the first to the last month in the data, inclusive (the same rule as the app). A month inside that span with no rows counts as zero; requested months before the first or after the last data month are excluded with a warning (usually outside the ~180-day history). Show any warnings to the user. If validation fails (missing columns, no data, months outside the range, duplicate project/month rows), show the errors and fix them with the user. Try at most 3 times.
 
 ### Step 4: Run the calculations
 Run the same command without `--validate-only`, adding `--results <DIR>/results.json`. Output file: `<DIR>/<Customer>_BigQuery_to_Snowflake_Estimate_<YYYY-MM-DD>.html`.
 
-The script follows the Calculation Sequence. Steps 1-7 run separately for RES and OD, and every project-month is calculated **on its own** (projects are never averaged together):
-- **Active hours** (per project-month) = `active_minutes_in_month / 60`. This is wall-clock time with at least one query running, overlaps merged, capped at the hours in that calendar month.
-- **Slot hours** = `total_slot_ms / 3,600,000`; **Average slots** = slot hours / 730; **X-Small nodes** = average slots / 16.
-- **Credits** (per project-month) = X-Small nodes × active hours × 1 credit per X-Small node hour. Track credits for a month = the sum of its projects' credits. The report lists every project-month's credits and each project's total.
-- **Monthly cost** = credits × price per credit. Step 7 averages each track's monthly credits over the months observed.
-- Step 8 combines the two tracks into the starting monthly credits.
+Compute uses **the same calculation as the Google Slot Calculator app**: every project-month is calculated **on its own** with that project's real measured clock time, then summed. Projects are never averaged together, and slot ms and active time are never pooled across projects.
+- Steps 1-3 (per project-month): **Slot hours** = `total_slot_ms / 3,600,000`; **Average slots** = slot hours / 730; **X-Small nodes** = average slots / 16 (fractional, not rounded up).
+- Step 4 (per project-month): **Active hours** = `active_minutes_in_month / 60`, the wall-clock time with at least one query running, overlaps merged, capped at the hours in that calendar month. This equals the app's hours/day × days/month.
+- Step 5 (per project-month): **Credits** = X-Small nodes × active hours × 1 credit per X-Small node hour; **Cost** = credits × price per credit.
+- Step 6: **Project total** = the sum of that project's months.
+- Step 7: **Snowflake total for the observed period** = the sum of all project totals. This is the figure the app reports for the same CSV and price per credit, and the report shows it first.
+- Step 8: **Projection baseline** = Step 7 credits / months observed (month 1 credits of the projection). Months observed = every calendar month from the first to the last month in the data, inclusive; the app uses the same rule.
 - Steps 9-11: storage starts at initial TB × (1 + TT/FS %) and grows monthly at each year's rate, where monthly rate = (1 + annual)^(1/12) − 1.
-- Step 12: compute grows the same way, using each year's compute rate.
-- Steps 13-14: Year 1/2/3 totals, then the low/high range.
+- Step 12: compute grows from the Step 8 baseline the same way, using each year's compute rate.
+- Steps 13-14: Year 1/2/3 projected totals (compute + storage), then the low/high range.
+
+The Year 1-3 figures are **projections** and will not equal the app's total: the app's total covers only the observed months, while Year 1 covers 12 months with growth, plus storage.
 
 ### Step 5: Present the HTML report
-Open the report with `open <report.html>`. Give the user the file path and a 3-line summary: Year 1, 2, and 3 calculated totals with ranges.
+Open the report with `open <report.html>`. Give the user the file path and a 4-line summary: the observed-period Snowflake total (matches the app), then the Year 1, 2, and 3 projected totals with ranges.
 
 **⚠️ STOP**: Ask for changes to the report. Formatting changes go in `build_html()` / `CSS` in `scripts/estimate.py`, then re-run Step 4.
 
@@ -93,4 +95,4 @@ Open the report with `open <report.html>`. Give the user the file path and a 3-l
 - `scripts/estimate.py`: validates the inputs, runs every calculation, and writes the HTML report (and an optional results JSON). Standard library only.
 
 ## Output
-`<customer>_bq_estimate/` folder containing the query, the CSV, `inputs.json`, `project_tags.json`, `results.json`, and the HTML report.
+`<customer>_bq_estimate/` folder containing the query, the CSV, `inputs.json`, `results.json`, and the HTML report.

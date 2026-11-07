@@ -110,4 +110,4 @@ FROM totals t
 JOIN active_time a USING (project_id, year_month)
 JOIN active_days d USING (project_id, year_month)
 ORDER BY t.year_month, t.total_slot_ms DESC;
--- Adapted from the BigQ calculator at https://app.snowflake.com/streamlit/sfcogsops/snowhouse_aws_us_west_2/#/apps/icosbexzbmbas7a4gzfw
+-- Adapted from the BigQ calculator at https://app.snowflake.com/streamlit/sfcogsops/snowhouse_aws_us_west_2/#/apps/ki4qh2k5pei7xqdkpz7k
